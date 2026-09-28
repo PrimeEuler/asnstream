@@ -1,0 +1,150 @@
+# asnstream
+
+A protobuf-style streaming system for SNMP MIBs. Import MIBs with
+[asn2json](https://github.com/PrimeEuler/asn2json), render BER with
+[PeculiarVentures/ASN1.js](https://github.com/PeculiarVentures/ASN1.js), and
+stream schema-driven binary messages the way protobuf streams do — except the
+schema language is SMI and every message is addressed by OID, like SNMP itself.
+
+## The idea
+
+| protobuf              | asnstream                          |
+|-----------------------|------------------------------------|
+| `.proto` file         | MIB file (SMIv1/SMIv2 ASN.1)       |
+| `protoc` codegen      | `asn2json` → JSON IR → registry    |
+| generated message     | `asn1js` schema compiled from MIB  |
+| length-delimited frame| `uint32BE len ‖ BER(SEQUENCE { type OID, payload OCTET STRING })` |
+| gRPC stream           | TCP or WebSocket duplex of frames  |
+
+Each frame is tagged with the OBJECT-TYPE's OID, so one stream multiplexes
+many object types — a table row, a scalar, a trap — and the receiver decodes
+each frame with the SYNTAX registered for that OID. Unknown OIDs pass through
+as raw bytes instead of killing the stream (like an agent forwarding a VarBind
+it has no MIB for).
+
+## Wire format
+
+```
++----------------+--------------------------------------------------+
+| uint32 BE = N  | BER: SEQUENCE {                                  |
+|                |   type    OBJECT IDENTIFIER  -- e.g. ifEntry    |
+|                |   payload OCTET STRING     -- BER of the value |
+|                | }  (N bytes)                                     |
++----------------+--------------------------------------------------+
+```
+
+The 4-byte prefix keeps the byte stream self-delimiting; BER alone cannot
+resync after a torn frame.
+
+## Usage
+
+```js
+const asnstream = require('asnstream');
+
+// 1. Import MIBs (asn2json does the parsing)
+const registry = asnstream.loadMibs('RFC1155-SMI.mib', 'RFC1213-MIB-II.mib');
+
+registry.oidOf('ifDescr');        // '1.3.6.1.2.1.2.2.1.2'
+registry.typeOfOid('1.3.6.1.2.1.2.2.1'); // 'IfEntry'
+
+// 2. Encode / decode single messages (BER via ASN1.js)
+const ber = asnstream.encodeMessage(registry, 'IfEntry', {
+  ifIndex: 2, ifDescr: 'eth0', ifType: 6, ifMtu: 1500,
+  ifSpeed: 1000000000, ifPhysAddress: Buffer.from('0242ac110002', 'hex'),
+  ifAdminStatus: 1, ifOperStatus: 1, ifLastChange: 42,
+  ifInOctets: 123456, /* ... all 22 fields ... */
+  ifSpecific: '0.0',
+});
+const row = asnstream.decodeMessage(registry, 'IfEntry', ber);
+row.ifDescr; // 'eth0'  (DisplayString <-> string)
+
+// 3. Stream them over TCP — OID-tagged, multiplexed
+const server = asnstream.tcp.serve(registry, 10161, ({ encoder }) => {
+  setInterval(() => encoder.write({ type: 'IfEntry', value: row }), 1000);
+});
+
+const { decoder } = await asnstream.tcp.connect(registry, 10161);
+decoder.on('data', (msg) => {
+  // { oid: '1.3.6.1.2.1.2.2.1', type: 'IfEntry', value: {...} }
+});
+```
+
+WebSocket works the same way (`asnstream.ws.serve` / `asnstream.ws.connect`,
+binary frames). `MessageEncoder` / `MessageDecoder` are plain Node Transform
+streams, so they compose with anything (`socket.pipe(decoder)`, file streams,
+etc.).
+
+## SMI fidelity
+
+- `Counter`/`Counter32`, `Gauge`, `TimeTicks`, `IpAddress`, `Opaque` keep
+  their SMI APPLICATION tags (implicit), so the BER matches what an SNMP
+  agent would emit for the same object.
+- `DisplayString` decodes to a JS string; other OCTET STRINGs to `Buffer`.
+- `SIZE` and INTEGER range constraints from the MIB are enforced on encode.
+- OBJECT-TYPE metadata (`objectInfo`: access, status, description, OID) is
+  available from the registry.
+
+Frames carry the OBJECT-TYPE OID (the *schema* identity, e.g. `ifEntry`),
+not an instance OID (`ifEntry.2`); instance discrimination lives in the
+payload's INDEX fields. This is the one deliberate departure from SNMP
+VarBinds, and it is what makes the stream protobuf-like instead of
+request/response-like.
+
+## Live proxies — getters subscribe, setters publish
+
+`src/proxy.js` marshals MIB objects into live remote objects over the
+stream, the jsix accessor pattern backed by frames instead of Fibre:
+
+```js
+const { marshal, unmarshal, linkFromStreams } = require('asnstream');
+const link = linkFromStreams(tcpLink.encoder, tcpLink.decoder);
+
+// scalar object: read subscribes, write publishes
+const contact = marshal(registry, 'sysContact', link); // read-write
+contact.value = 'sysop@mesh';        // -> OID-tagged frame on the wire
+console.log(contact.value);          // last-known value
+
+// table: rows materialize as frames arrive, keyed by INDEX
+const ifTable = marshal(registry, 'ifEntry', link);
+ifTable.on('row', (row) => console.log('new interface:', row.ifDescr));
+ifTable.get(3).ifAdminStatus = 2;    // publishes a full-row update
+ifTable.get(3).ifDescr = 'x';        // throws: ACCESS read-only
+
+const snap = unmarshal(ifTable);     // plain detached snapshot
+ifTable.release();                   // detach; state frozen, not forgotten
+```
+
+Rules:
+
+- Constructing a proxy subscribes it (one shared dispatcher per link, so
+  N proxies cost one `data` listener). `release()` detaches.
+- ACCESS is enforced at the language level: writing a read-only object or
+  column throws; reading a `not-accessible` object throws.
+- Row column setters do read-modify-write on the cached row and publish the
+  full row — you cannot set a column of a row you have never seen.
+- `TableProxy.publish(row)` is the agent side: announce a row from a poll
+  loop. Events: `row` on first sight, `update` on every row update.
+- Proxies also emit jsix-accessor-compatible `get`/`set` events for the
+  browser bridge.
+
+## Layout
+
+```
+src/registry.js  MIB loading via asn2json, type resolution, OID tree
+src/codec.js     JS values <-> BER via compiled asn1js schemas
+src/frame.js     OID-tagged length-delimited framing + incremental splitter
+src/streams.js   MessageEncoder / MessageDecoder Transform streams
+src/proxy.js     live remote objects: marshal / unmarshal, ACCESS, tables
+src/tcp.js       TCP transport
+src/ws.js        WebSocket transport (needs the `ws` package)
+demo/mib2.js     fake agent streaming MIB-II ifTable rows (npm run demo)
+test/test.js     round-trip suite (npm test)
+test/proxy.js    live-proxy suite (npm test)
+```
+
+## Status
+
+Sandbox prototype, 2026-09-28. BER only (no SNMP PDU layer — by design;
+this is a streaming transport, not an SNMP stack). Notable asn1js v3 quirk
+handled inside: typed constructors hard-override `idBlock`, so SMI
+application tags are applied post-construction.
