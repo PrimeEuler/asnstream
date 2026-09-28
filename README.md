@@ -178,6 +178,67 @@ Parser quirks worth knowing (both from `asn2json`, not from this layer):
   `["SEQUENCE OF", "X"]` while `SET OF` parses as `{"SET OF": "X"}`.
   The registry normalizes all of these.
 
+## ASN.1 values — populate structures with text
+
+Modules can carry data, not just schema. `loadValues` (or `loadModule`
+for both at once) parses ASN.1 value notation and stores named values:
+
+```asn1
+ChatData DEFINITIONS ::= BEGIN
+  greeting Message ::= {
+    sender "jeremy",
+    body "hello back",
+    tags { "mesh", "bbs" },
+    priority 1
+  }
+  status Presence ::= online
+  inbox Roster ::= { greeting }
+END
+```
+
+```js
+reg.loadText(schemaText, 'Chat');          // schema, as before
+reg.loadValues(dataText);                  // data, validated against it
+// or: reg.loadModule(moduleText, 'Chat'); // schema + values in one pass
+
+reg.valueOf('greeting');   // { sender: 'jeremy', body: 'hello back', ... }
+reg.valueNames();          // ['greeting', 'status', 'inbox', ...]
+reg.valueType('greeting'); // 'Message'
+
+// loaded values encode, decode, and publish like anything else
+encoder.write({ type: 'Message', value: reg.valueOf('greeting') });
+const msg = marshal(reg, 'Message', link);
+Object.assign(msg, reg.valueOf('greeting'));  // setters publish
+```
+
+Scalars, enums (by symbol), `CHOICE`, `SEQUENCE OF`/`SET OF`, hex/octet
+and binary `BIT STRING`s, `OBJECT IDENTIFIER`s, and time strings (as
+`Date`) are all supported. Values are type-checked at load; `valueOf`
+returns a defensive copy. (`loadText` refuses data assignments with a
+pointer to `loadValues`, because the schema parser would silently
+misread them.)
+
+## RPC — callable code lives in the OID tree
+
+`defineProcedure` namespaces a procedure under an OID node; the call
+envelope rides at `P.0` and the result envelope at `P.1`, so remote calls
+are just frame publishes and the registry doubles as a walkable
+directory of callable code:
+
+```js
+const add = asnstream.defineProcedure(reg, 'add', {
+  args: 'AddArgs', result: 'AddResult', oid: '1.3.6.1.4.1.99999.7.1',
+});
+asnstream.serveProcedure(serverLink, add, ({ a, b }) => ({ sum: a + b }));
+const { sum } = await asnstream.callProcedure(clientLink, add, { a: 3, b: 4 });
+```
+
+Handlers may be async; concurrent calls correlate by `callId`;
+server-side exceptions reject the caller's promise with the server's
+error string; calls time out (default 10s, `{ timeout }` overrides).
+`serveProcedure` returns an `unserve()` function, and
+`reg.procedures()` / `asnstream.listProcedures(reg)` lists what's defined.
+
 ## Layout
 
 ```
@@ -186,12 +247,16 @@ src/codec.js     JS values <-> BER via compiled asn1js schemas
 src/frame.js     OID-tagged length-delimited framing + incremental splitter
 src/streams.js   MessageEncoder / MessageDecoder Transform streams
 src/proxy.js     live remote objects: marshal / unmarshal, ACCESS, tables, structs, lists
+src/values.js    ASN.1 value-notation parsing (loadValues / loadModule)
+src/rpc.js       OID-namespaced remote procedures
 src/tcp.js       TCP transport
 src/ws.js        WebSocket transport (needs the `ws` package)
 demo/mib2.js     fake agent streaming MIB-II ifTable rows (npm run demo)
 test/test.js     round-trip suite (npm test)
 test/proxy.js    live-proxy suite (npm test)
 test/schema.js   generic-ASN.1 suite (npm test)
+test/values.js   value-notation suite (npm test)
+test/rpc.js      RPC suite (npm test)
 ```
 
 ## Status

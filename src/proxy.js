@@ -533,6 +533,8 @@ module.exports = {
   marshal,
   unmarshal,
   linkFromStreams,
+  hubAdd,
+  hubRemove,
   ValueProxy,
   RowProxy,
   TableProxy,

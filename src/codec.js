@@ -416,18 +416,39 @@ function decodeMessage(registry, typeName, buffer) {
   const compared = asn1js.compareSchema(parsed.result, parsed.result, schema);
   if (!compared.verified) {
     // compareSchema is tag- and arity-strict: it rejects sequences with
-    // absent OPTIONAL fields, explicitly tagged fields, and SET OF
-    // wrappers. Those shapes still get a structural decode — decodeValue
-    // enforces field presence itself.
-    const lax = (desc.kind === 'sequence' && desc.fields.some(f => f.optional || f.tagNumber !== undefined))
-      || (desc.kind === 'choice' && desc.choices.some(c => c.tagNumber !== undefined))
-      || desc.kind === 'setOf';
-    if (!lax) {
+    // absent OPTIONAL fields, explicitly tagged fields, SET OF wrappers,
+    // and (at any nesting depth) CHOICEs with tagged alternatives. Those
+    // shapes still get a structural decode — decodeValue enforces field
+    // presence itself.
+    if (!needsStructuralDecode(registry, desc)) {
       throw new Error(`Schema mismatch decoding ${typeName}: ${JSON.stringify(compared.result && compared.result.error)}`);
     }
     return decodeValue(registry, desc, parsed.result);
   }
   return decodeValue(registry, desc, compared.result);
+}
+
+/**
+ * True when the type's shape needs the structural decoder: anything
+ * compareSchema is strict about — OPTIONALs, [n] tags, tagged CHOICE
+ * alternatives, SET OF — at any nesting depth.
+ */
+function needsStructuralDecode(registry, desc, seen = new Set()) {
+  if (!desc || typeof desc.name !== 'string' || seen.has(desc.name)) return false;
+  seen.add(desc.name);
+  const inner = (ref) => {
+    try { return needsStructuralDecode(registry, registry.resolveType(ref), seen); }
+    catch { return false; }
+  };
+  if (desc.kind === 'sequence') {
+    return desc.fields.some((f) =>
+      f.optional || f.tagNumber !== undefined || inner(f.typeRef));
+  }
+  if (desc.kind === 'choice') {
+    return desc.choices.some((c) =>
+      c.tagNumber !== undefined || inner(c.typeRef));
+  }
+  return desc.kind === 'setOf';
 }
 
 module.exports = {

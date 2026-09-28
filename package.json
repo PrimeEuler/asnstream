@@ -18,7 +18,7 @@
   "name": "asnstream",
   "scripts": {
     "demo": "node demo/mib2.js",
-    "test": "node test/test.js && node test/proxy.js && node test/schema.js"
+    "test": "node test/test.js && node test/proxy.js && node test/schema.js && node test/values.js && node test/rpc.js"
   },
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

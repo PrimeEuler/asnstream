@@ -12,6 +12,7 @@ const frame = require('./frame');
 const streams = require('./streams');
 const tcp = require('./tcp');
 const proxy = require('./proxy');
+const rpc = require('./rpc');
 
 let ws = null;
 try { ws = require('./ws'); } catch { /* 'ws' is optional */ }
@@ -35,6 +36,10 @@ module.exports = {
   marshal: proxy.marshal,
   unmarshal: proxy.unmarshal,
   linkFromStreams: proxy.linkFromStreams,
+  defineProcedure: rpc.defineProcedure,
+  listProcedures: rpc.listProcedures,
+  serveProcedure: rpc.serveProcedure,
+  callProcedure: rpc.callProcedure,
   ValueProxy: proxy.ValueProxy,
   RowProxy: proxy.RowProxy,
   TableProxy: proxy.TableProxy,

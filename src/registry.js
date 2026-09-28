@@ -15,6 +15,19 @@
 const asn2json = require('asn2json');
 const fs = require('fs');
 
+/** Deep copy for value-table data: preserves Buffer and Date. */
+function cloneData(v) {
+  if (Buffer.isBuffer(v)) return Buffer.from(v);
+  if (v instanceof Date) return new Date(v.getTime());
+  if (Array.isArray(v)) return v.map(cloneData);
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = cloneData(v[k]);
+    return o;
+  }
+  return v;
+}
+
 // Well-known SMI roots, as full dotted OIDs, for parent-chain resolution.
 const WELL_KNOWN_ROOTS = { root: '', iso: '1', org: '1.3', dod: '1.3.6' };
 
@@ -75,6 +88,8 @@ class MibRegistry {
     this._oidToType = new Map();// dotted OID -> message type name
     this._typeToOid = new Map();// message type name -> dotted OID
     this._assignedOids = new Map(); // name -> explicitly/auto-assigned OID
+    this._values = new Map();     // value name -> { typeName, value }
+    this._procedures = new Map(); // procedure name -> descriptor (see rpc.js)
   }
 
   loadFile(filePath, moduleName) {
@@ -82,6 +97,21 @@ class MibRegistry {
   }
 
   loadText(text, moduleName) {
+    const { tokenize, scanBody, matchValueAssign } = require('./values');
+    const found = [];
+    scanBody(tokenize(text), (t, i) => {
+      const m = matchValueAssign(t, i);
+      if (m) found.push(m.name);
+      return 0;
+    });
+    if (found.length) {
+      throw new Error(
+        `loadText: found value assignment${found.length > 1 ? 's' : ''} ` +
+        `(${found.slice(0, 3).join(', ')}${found.length > 3 ? ', …' : ''}) — ` +
+        `ASN.1 data doesn't belong in loadText (asn2json would misread it as schema). ` +
+        `Use loadValues() or loadModule() instead.`
+      );
+    }
     const parser = new asn2json();
     const parsed = parser.parse(text);
     for (const mod of Object.keys(parsed)) {
@@ -97,6 +127,72 @@ class MibRegistry {
     this._typeCache.clear();
     this._oidToType.clear();
     return this;
+  }
+
+  /**
+   * Register a type definition directly from JSON IR, without parsing
+   * ASN.1 text — for programmatically synthesized types (e.g. the RPC
+   * call/result envelopes built by rpc.js). `def` is the same IR shape
+   * asn2json produces, e.g. `{ SEQUENCE: [['a', 'INTEGER']] }`.
+   */
+  registerType(name, def) {
+    this.defs.set(name, { module: 'synthetic', def });
+    this._oidCache.clear();
+    this._typeCache.clear();
+    this._oidToType.clear();
+    this._typeToOid.clear();
+    return this;
+  }
+
+  /**
+   * Load `name Type ::= value` assignments from ASN.1 text into the
+   * registry's value table (see src/values.js). Schema and data may live
+   * in the same module text; call after loadText(), or use loadModule()
+   * to do both at once.
+   */
+  loadValues(text) {
+    const { parseValueAssignments } = require('./values');
+    for (const { name, typeName, value } of parseValueAssignments(text, this)) {
+      this.defineValue(name, typeName, value);
+    }
+    return this;
+  }
+
+  /** loadText() + loadValues() in one pass over the same module text. */
+  loadModule(text, moduleName) {
+    const { stripValueAssignments } = require('./values');
+    return this.loadText(stripValueAssignments(text), moduleName).loadValues(text);
+  }
+
+  /** Store a named, typed data value directly (JS value, type-checked on use). */
+  defineValue(name, typeName, value) {
+    this.resolveType(typeName); // throws on unknown types
+    this._values.set(name, { typeName, value: cloneData(value) });
+    return this;
+  }
+
+  /** The named value's type name, or throws for unknown values. */
+  valueType(name) {
+    const e = this._values.get(name);
+    if (!e) throw new Error(`Unknown value: ${name}`);
+    return e.typeName;
+  }
+
+  /** A fresh copy of the named value (mutating it can't corrupt the table). */
+  valueOf(name) {
+    const e = this._values.get(name);
+    if (!e) throw new Error(`Unknown value: ${name}`);
+    return cloneData(e.value);
+  }
+
+  /** Names of all loaded values. */
+  valueNames() {
+    return [...this._values.keys()];
+  }
+
+  /** Procedure descriptors registered by defineProcedure() (see rpc.js). */
+  procedures() {
+    return [...this._procedures.values()];
   }
 
   /** Raw IR definition for a name, or undefined. */
