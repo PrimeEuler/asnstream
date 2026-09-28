@@ -38,6 +38,9 @@ module.exports = {
   ValueProxy: proxy.ValueProxy,
   RowProxy: proxy.RowProxy,
   TableProxy: proxy.TableProxy,
+  StructProxy: proxy.StructProxy,
+  ElementProxy: proxy.ElementProxy,
+  ListProxy: proxy.ListProxy,
   tcp,
   ws,
 };

@@ -31,6 +31,14 @@
  * Subscription is implicit and local: one dispatcher per link routes each
  * incoming frame to the proxies whose OID matches. (Server-side filtering
  * is a later optimization; the wire already carries everything.)
+ *
+ * Beyond SMI: marshal() also accepts any named ASN.1 type, not just
+ * OBJECT-TYPEs. A SEQUENCE becomes a StructProxy (fields as live
+ * properties, whole-struct publish), a SEQUENCE OF / SET OF becomes a
+ * ListProxy (ordinal-keyed live collection), and any other type becomes a
+ * ValueProxy. Schema types default to read-write ACCESS (override with
+ * marshal's { access } option) and need a wire OID — see
+ * registry.setTypeOid / autoAssignOids.
  */
 const { EventEmitter } = require('events');
 
@@ -104,9 +112,11 @@ function linkFromStreams(encoder, decoder) {
 // ValueProxy — a single scalar / non-table object (e.g. 'sysContact').
 // ---------------------------------------------------------------------------
 class ValueProxy extends EventEmitter {
-  constructor(registry, objectName, link) {
+  constructor(registry, objectName, link, opts = {}) {
     super();
-    const info = registry.objectInfo(objectName);
+    // opts.spec lets marshal() reuse this class for non-MIB scalar types:
+    // { name, oid, typeName, access }.
+    const info = opts.spec || registry.objectInfo(objectName);
     this._registry = registry;
     this._link = link;
     this._name = objectName;
@@ -267,20 +277,238 @@ class TableProxy extends EventEmitter {
 }
 
 // ---------------------------------------------------------------------------
+// StructProxy — a live SEQUENCE value: fields are live properties, setting
+// one publishes the whole struct (read-modify-write on the cached value).
+// The schema-type analogue of RowProxy, without a table around it.
+// ---------------------------------------------------------------------------
+class StructProxy extends EventEmitter {
+  constructor(registry, typeName, link, opts = {}) {
+    super();
+    const desc = registry.resolveType(typeName);
+    if (desc.kind !== 'sequence') throw new Error(`${typeName} is not a SEQUENCE`);
+    this._registry = registry;
+    this._link = link;
+    this._name = typeName;
+    this._typeName = typeName;
+    this._oid = opts.oid || registry.oidOfType(typeName);
+    this._access = opts.access || 'read-write';
+    this._struct = null; // last-known value, or null until the first frame
+    this._fields = desc.fields;
+    for (const f of this._fields) {
+      Object.defineProperty(this, f.name, {
+        enumerable: true,
+        configurable: true,
+        get: () => {
+          this.emit('get', this._oid, f.name);
+          return this._struct ? this._struct[f.name] : undefined;
+        },
+        set: (v) => this._setField(f.name, v),
+      });
+    }
+    this._onFrame = (msg) => {
+      if (msg.type === null || msg.type === undefined) return;
+      this._applyStruct(msg.value);
+    };
+    hubAdd(link, this._oid, this._onFrame);
+  }
+
+  _setField(name, v) {
+    assertWritable(this._access, `${this._name}.${name}`);
+    if (!this._struct) throw new Error(`Cannot set ${name}: no ${this._name} seen yet`);
+    this.publish(Object.assign({}, this._struct, { [name]: v }));
+    this.emit('set', this._oid, this._struct);
+  }
+
+  /**
+   * Publish a whole struct: announces it on the stream and applies it
+   * locally. The agent side of the struct, and what field setters call
+   * after read-modify-write.
+   */
+  publish(obj) {
+    assertWritable(this._access, this._name);
+    this._link.send({ oid: this._oid, type: this._typeName, value: obj });
+    this._applyStruct(obj);
+    return this;
+  }
+
+  _applyStruct(obj) {
+    this._struct = obj;
+    this.emit('update', obj);
+  }
+
+  /** Detach from the link; the proxy keeps its last-known struct. */
+  release() {
+    hubRemove(this._link, this._oid, this._onFrame);
+    this.removeAllListeners();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ElementProxy — one element of a ListProxy whose element type is a
+// SEQUENCE; fields are live properties bound to that ordinal position.
+// ---------------------------------------------------------------------------
+class ElementProxy extends EventEmitter {
+  constructor(list, index) {
+    super();
+    this._list = list;
+    this._index = index;
+    this._el = null;
+    for (const f of list._elDesc.fields) {
+      Object.defineProperty(this, f.name, {
+        enumerable: true,
+        configurable: true,
+        get: () => {
+          this.emit('get', list._oid, `${index}.${f.name}`);
+          return this._el ? this._el[f.name] : undefined;
+        },
+        set: (v) => {
+          assertWritable(list._access, `${list._name}[${index}].${f.name}`);
+          if (!this._el) throw new Error(`Cannot set ${f.name}: element ${index} not present`);
+          list.set(index, Object.assign({}, this._el, { [f.name]: v }));
+        },
+      });
+    }
+  }
+
+  _applyElement(el) {
+    this._el = el === undefined ? null : el;
+    this.emit('update', this._el);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ListProxy — a live SEQUENCE OF / SET OF collection, ordinal-keyed.
+// Scalar elements are read with get(i); SEQUENCE elements get live
+// ElementProxies. publish() is the agent side; set/push do
+// read-modify-write publishes.
+// ---------------------------------------------------------------------------
+class ListProxy extends EventEmitter {
+  constructor(registry, typeName, link, opts = {}) {
+    super();
+    const desc = registry.resolveType(typeName);
+    if (desc.kind !== 'sequenceOf' && desc.kind !== 'setOf') {
+      throw new Error(`${typeName} is not a SEQUENCE OF / SET OF`);
+    }
+    this._registry = registry;
+    this._link = link;
+    this._name = typeName;
+    this._typeName = typeName;
+    this._oid = opts.oid || registry.oidOfType(typeName);
+    this._access = opts.access || 'read-write';
+    this._elDesc = registry.resolveType(desc.elementRef);
+    this._items = null; // last-known array, or null until the first frame
+    this._elements = new Map(); // index -> ElementProxy, for SEQUENCE elements
+    this._onFrame = (msg) => {
+      if (msg.type === null || msg.type === undefined) return;
+      this._applyItems(msg.value);
+    };
+    hubAdd(link, this._oid, this._onFrame);
+  }
+
+  get length() { return this._items ? this._items.length : 0; }
+
+  /** Last-known array (detached clone), or [] before the first frame. */
+  values() { return this._items ? deepClone(this._items) : []; }
+
+  /**
+   * Publish a whole array: announces it on the stream and applies it
+   * locally. The agent side of the collection.
+   */
+  publish(array) {
+    assertWritable(this._access, this._name);
+    if (!Array.isArray(array)) throw new TypeError(`Expected array for ${this._name}`);
+    this._link.send({ oid: this._oid, type: this._typeName, value: array });
+    this._applyItems(array);
+    return this;
+  }
+
+  _applyItems(array) {
+    this._items = array;
+    for (const [i, ep] of this._elements) ep._applyElement(array[i]);
+    this.emit('update', this.values());
+  }
+
+  /**
+   * Live element at ordinal i. For SEQUENCE element types this is an
+   * ElementProxy with live fields (created on demand, fills in as frames
+   * arrive); for scalar elements it's the last-known value.
+   */
+  get(i) {
+    if (this._elDesc.kind === 'sequence') {
+      let ep = this._elements.get(i);
+      if (!ep) {
+        ep = new ElementProxy(this, i);
+        this._elements.set(i, ep);
+        // Seed from the last-known array when we already hold it.
+        ep._applyElement(this._items ? this._items[i] : undefined);
+      }
+      return ep;
+    }
+    this.emit('get', this._oid, i);
+    return this._items ? this._items[i] : undefined;
+  }
+
+  /** Replace element i (read-modify-write publish). */
+  set(i, v) {
+    assertWritable(this._access, `${this._name}[${i}]`);
+    if (!this._items) throw new Error(`Cannot set [${i}]: no ${this._name} seen yet`);
+    const next = this._items.slice();
+    next[i] = v;
+    this.publish(next);
+    this.emit('set', this._oid, next);
+  }
+
+  /** Append an element (read-modify-write publish). */
+  push(v) {
+    this.publish(this.values().concat([v]));
+    this.emit('set', this._oid, this.values());
+  }
+
+  /** Detach from the link; the proxy keeps its last-known array. */
+  release() {
+    hubRemove(this._link, this._oid, this._onFrame);
+    this.removeAllListeners();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Marshal a named MIB object into a live proxy on the link.
- * Tables (INDEX clause) -> TableProxy; anything else -> ValueProxy.
+ * Marshal a named object into a live proxy on the link.
+ *
+ * MIB OBJECT-TYPEs keep their existing behavior: tables (INDEX clause) ->
+ * TableProxy, anything else -> ValueProxy with SMI ACCESS enforcement.
+ *
+ * Any other named ASN.1 type also marshals: SEQUENCE -> StructProxy,
+ * SEQUENCE OF / SET OF -> ListProxy, anything else -> ValueProxy.
+ * Schema types default to read-write (override with { access }) and need a
+ * wire OID — assign one with registry.setTypeOid() / autoAssignOids().
  */
-function marshal(registry, objectName, link) {
+function marshal(registry, name, link, opts = {}) {
   if (!link || typeof link.send !== 'function' || typeof link.onMessage !== 'function') {
     throw new TypeError('marshal needs a link { send(msg), onMessage(cb) } — see linkFromStreams()');
   }
-  return registry.tableInfo(objectName)
-    ? new TableProxy(registry, objectName, link)
-    : new ValueProxy(registry, objectName, link);
+  if (registry.tableInfo(name)) return new TableProxy(registry, name, link);
+  const def = typeof registry.define === 'function' ? registry.define(name) : undefined;
+  if (def && def['OBJECT-TYPE']) return new ValueProxy(registry, name, link);
+  const desc = registry.resolveType(name);
+  const access = opts.access || 'read-write';
+  let oid;
+  try {
+    oid = registry.oidOfType(name);
+  } catch {
+    throw new Error(
+      `${name} has no OID on the wire — assign one with ` +
+      `registry.setTypeOid('${name}', '1.3.6.1.4.1.<pen>.<n>') or registry.autoAssignOids(base)`
+    );
+  }
+  if (desc.kind === 'sequence') return new StructProxy(registry, name, link, { oid, access });
+  if (desc.kind === 'sequenceOf' || desc.kind === 'setOf') {
+    return new ListProxy(registry, name, link, { oid, access });
+  }
+  return new ValueProxy(registry, name, link, { spec: { name, oid, typeName: name, access } });
 }
 
 /**
@@ -294,6 +522,9 @@ function unmarshal(proxy) {
     return out;
   }
   if (proxy instanceof RowProxy) return proxy._row ? deepClone(proxy._row) : null;
+  if (proxy instanceof StructProxy) return proxy._struct ? deepClone(proxy._struct) : null;
+  if (proxy instanceof ElementProxy) return proxy._el ? deepClone(proxy._el) : null;
+  if (proxy instanceof ListProxy) return proxy._items ? deepClone(proxy._items) : [];
   if (proxy instanceof ValueProxy) return deepClone(proxy._value);
   throw new TypeError('unmarshal needs a proxy from marshal()');
 }
@@ -305,4 +536,7 @@ module.exports = {
   ValueProxy,
   RowProxy,
   TableProxy,
+  StructProxy,
+  ElementProxy,
+  ListProxy,
 };

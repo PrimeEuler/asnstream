@@ -20,7 +20,8 @@ const WELL_KNOWN_ROOTS = { root: '', iso: '1', org: '1.3', dod: '1.3.6' };
 
 const TAG_CLASSES = { UNIVERSAL: 1, APPLICATION: 2, CONTEXT: 3, PRIVATE: 4 };
 
-// Built-in ASN.1 types every MIB can reference without defining.
+// Built-in ASN.1 types every module can reference without defining.
+// Character strings and time types decode to JS strings / Dates.
 const BUILTINS = {
   'INTEGER':           { kind: 'integer' },
   'BOOLEAN':           { kind: 'boolean' },
@@ -29,6 +30,17 @@ const BUILTINS = {
   'OBJECT IDENTIFIER': { kind: 'oid' },
   'BIT STRING':        { kind: 'bitstring' },
   'ENUMERATED':        { kind: 'enumerated' },
+  'UTF8String':        { kind: 'charstring', stringType: 'Utf8String' },
+  'PrintableString':   { kind: 'charstring', stringType: 'PrintableString' },
+  'IA5String':         { kind: 'charstring', stringType: 'IA5String' },
+  'VisibleString':     { kind: 'charstring', stringType: 'VisibleString' },
+  'NumericString':     { kind: 'charstring', stringType: 'NumericString' },
+  'BMPString':         { kind: 'charstring', stringType: 'BmpString' },
+  'UniversalString':   { kind: 'charstring', stringType: 'UniversalString' },
+  'TeletexString':     { kind: 'charstring', stringType: 'TeletexString' },
+  'GeneralString':     { kind: 'charstring', stringType: 'GeneralString' },
+  'UTCTime':           { kind: 'time', timeType: 'UTCTime' },
+  'GeneralizedTime':   { kind: 'time', timeType: 'GeneralizedTime' },
 };
 
 // SMIv1/v2 application types not always spelled out in every MIB.
@@ -43,6 +55,17 @@ const SMI_FALLBACK = {
   'NetworkAddress': { kind: 'choice', note: 'IpAddress only in practice' },
 };
 
+/**
+ * Normalize asn2json's SEQUENCE/CHOICE member list: a single-field type
+ * comes back as one bare tuple ["name", typeRef], multi-field as an array
+ * of tuples. A tuple always starts with the member name string.
+ */
+function asTuples(members) {
+  if (!Array.isArray(members)) return [];
+  if (members.length > 0 && typeof members[0] === 'string') return [members];
+  return members;
+}
+
 class MibRegistry {
   constructor() {
     this.modules = {};          // moduleName -> DEFINITIONS object
@@ -51,6 +74,7 @@ class MibRegistry {
     this._typeCache = new Map();// name -> resolved descriptor
     this._oidToType = new Map();// dotted OID -> message type name
     this._typeToOid = new Map();// message type name -> dotted OID
+    this._assignedOids = new Map(); // name -> explicitly/auto-assigned OID
   }
 
   loadFile(filePath, moduleName) {
@@ -84,10 +108,42 @@ class MibRegistry {
   /** Dotted OID for a named node, e.g. '1.3.6.1.2.1.2.2.1.2'. Pass-through for dotted input. */
   oidOf(name) {
     if (/^[0-9]+(\.[0-9]+)*$/.test(name)) return name;
+    if (this._assignedOids.has(name)) return this._assignedOids.get(name);
     if (this._oidCache.has(name)) return this._oidCache.get(name);
     const oid = this._resolveOid(name, new Set());
     this._oidCache.set(name, oid);
     return oid;
+  }
+
+  /**
+   * Pin an OID onto a named type that has no SMI '::=' assignment —
+   * the bridge that lets arbitrary ASN.1 types ride the OID-tagged wire.
+   */
+  setTypeOid(name, oid) {
+    if (!/^[0-9]+(\.[0-9]+)*$/.test(oid)) throw new Error(`Not a dotted OID: ${oid}`);
+    if (!this.defs.has(name) && !BUILTINS[name]) throw new Error(`Unknown type: ${name}`);
+    this._assignedOids.set(name, oid);
+    this._oidToType.clear();
+    this._typeToOid.clear();
+    return this;
+  }
+
+  /**
+   * Assign OIDs to every named definition that lacks one, sequentially
+   * under the given base arc (sorted by name, so the mapping is stable
+   * for a fixed schema). Types that already resolve to an OID keep theirs.
+   */
+  autoAssignOids(base) {
+    if (!/^[0-9]+(\.[0-9]+)*$/.test(base)) throw new Error(`Not a dotted OID arc: ${base}`);
+    let n = 1;
+    for (const name of [...this.defs.keys()].sort()) {
+      if (this._assignedOids.has(name)) continue;
+      try { this.oidOf(name); continue; } catch { /* needs assignment */ }
+      this._assignedOids.set(name, `${base}.${n++}`);
+    }
+    this._oidToType.clear();
+    this._typeToOid.clear();
+    return this;
   }
 
   _resolveOid(name, seen) {
@@ -129,6 +185,10 @@ class MibRegistry {
    * normalized descriptor used by the schema compiler.
    */
   resolveType(typeRef) {
+    // Inline constructed refs (['SEQUENCE OF', elem]) bypass the name cache.
+    if (Array.isArray(typeRef) && (typeRef[0] === 'SEQUENCE OF' || typeRef[0] === 'SET OF')) {
+      return this._resolveTypeRef(typeRef, new Set());
+    }
     const [name, constraints] = Array.isArray(typeRef) ? typeRef : [typeRef, undefined];
     const cacheKey = constraints ? `${name}#${JSON.stringify(constraints)}` : name;
     if (this._typeCache.has(cacheKey)) return this._typeCache.get(cacheKey);
@@ -150,6 +210,12 @@ class MibRegistry {
       throw new Error(`Unknown type: ${name}`);
     }
 
+    // Top-level 'Roster ::= SEQUENCE OF Message' comes back as a bare
+    // array ['SEQUENCE OF', elem] (SET OF as { 'SET OF': elem }).
+    if (Array.isArray(def) && (def[0] === 'SEQUENCE OF' || def[0] === 'SET OF')) {
+      return { name, smi: name, kind: def[0] === 'SEQUENCE OF' ? 'sequenceOf' : 'setOf', elementRef: def[1] };
+    }
+
     // Plain alias: "DisplayString": "OCTET STRING" (or another type name).
     if (typeof def === 'string') {
       const inner = this._resolveType(def, seen);
@@ -168,19 +234,41 @@ class MibRegistry {
     }
 
     if (def.SEQUENCE) {
-      return {
-        name, smi: name, kind: 'sequence',
-        fields: def.SEQUENCE.map(([fname, ftype]) => ({ name: fname, typeRef: ftype })),
-      };
+      const fields = asTuples(def.SEQUENCE).map((tuple) => this._fieldTuple(tuple, name));
+      // Untagged OPTIONALs are only unambiguous at the tail: a short wire
+      // tail decodes as absent trailing optionals. After the first untagged
+      // OPTIONAL, every later field must carry an explicit [n] tag —
+      // otherwise a present field would land in the absent optional's slot.
+      // Fail fast with a clear message, not a silent mis-decode.
+      let seenUntaggedOptional = false;
+      for (const f of fields) {
+        if (seenUntaggedOptional && f.tagNumber === undefined) {
+          throw new Error(
+            `SEQUENCE ${name}: untagged OPTIONAL followed by untagged field '${f.name}' — ` +
+            `ambiguous in BER. Give later fields explicit [n] tags.`
+          );
+        }
+        if (f.optional && f.tagNumber === undefined) seenUntaggedOptional = true;
+      }
+      return { name, smi: name, kind: 'sequence', fields };
     }
     if (def.CHOICE) {
       return {
         name, smi: name, kind: 'choice',
-        choices: def.CHOICE.map(([fname, ftype]) => ({ name: fname, typeRef: ftype })),
+        choices: asTuples(def.CHOICE).map((tuple) => this._fieldTuple(tuple, name)),
       };
     }
     if (def['SEQUENCE OF']) {
       return { name, smi: name, kind: 'sequenceOf', elementRef: def['SEQUENCE OF'] };
+    }
+    if (def['SET OF']) {
+      return { name, smi: name, kind: 'setOf', elementRef: def['SET OF'] };
+    }
+    if (def.ENUMERATED) {
+      // asn2json IR: { "0": "away", "1": "online", ... } (number -> name)
+      const symbols = {};
+      for (const [num, sym] of Object.entries(def.ENUMERATED)) symbols[sym] = Number(num);
+      return { name, smi: name, kind: 'enumerated', symbols };
     }
     // OBJECT-TYPE used as a type ref: resolve through its SYNTAX.
     if (def['OBJECT-TYPE'] && def['OBJECT-TYPE'].SYNTAX) {
@@ -190,7 +278,49 @@ class MibRegistry {
     throw new Error(`Cannot resolve type ${name}: unrecognized definition shape`);
   }
 
+  /**
+   * Normalize an asn2json field/alternative tuple:
+   *   [name, typeRef] | [name, typeRef, 'OPTIONAL'] |
+   *   [name, { tag: { class, number }, definition, type }, 'OPTIONAL']
+   * A bare [n] tag defaults to CONTEXT-SPECIFIC, per X.680. Anonymous inline
+   * types ({ SEQUENCE: [...] } as the type) are registered under a
+   * synthesized `Owner.field` name so the rest of the machinery — codec,
+   * proxy, OID index — sees only named types.
+   */
+  _fieldTuple(tuple, ownerName) {
+    const [fname, ftype, ...rest] = tuple;
+    const field = {
+      name: fname,
+      typeRef: ftype,
+      optional: rest.includes('OPTIONAL') || rest.includes('DEFAULT'),
+      tagClass: undefined,
+      tagNumber: undefined,
+      implicit: true,
+    };
+    let inner = ftype;
+    if (ftype && typeof ftype === 'object' && ftype.tag) {
+      inner = ftype.type;
+      field.tagClass = ftype.tag.class ? (TAG_CLASSES[ftype.tag.class] || 3) : 3;
+      field.tagNumber = ftype.tag.number;
+      field.implicit = ftype.definition !== 'EXPLICIT';
+    }
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      const synth = `${ownerName || 'Anonymous'}$${fname}`;
+      if (!this.defs.has(synth)) this.defs.set(synth, { module: 'inline', def: inner });
+      field.typeRef = synth;
+    } else {
+      field.typeRef = inner;
+    }
+    return field;
+  }
+
   _resolveTypeRef(typeRef, seen) {
+    // Inline constructed refs: ['SEQUENCE OF', elemType] / ['SET OF', elemType].
+    // (Plain [name, constraints] pairs are handled by resolveType.)
+    if (Array.isArray(typeRef) && (typeRef[0] === 'SEQUENCE OF' || typeRef[0] === 'SET OF')) {
+      const kind = typeRef[0] === 'SEQUENCE OF' ? 'sequenceOf' : 'setOf';
+      return { name: typeRef[0], kind, elementRef: typeRef[1] };
+    }
     const [name, constraints] = Array.isArray(typeRef) ? typeRef : [typeRef, undefined];
     const desc = this._resolveType(name, seen);
     if (constraints) desc.constraints = Object.assign({}, desc.constraints, constraints);
@@ -241,14 +371,20 @@ class MibRegistry {
       try { oid = this.oidOf(name); } catch { continue; }
       if (!/^[0-9.]+$/.test(oid)) continue;
       const def = this.define(name);
-      if (!def || !def['OBJECT-TYPE'] || !def['OBJECT-TYPE'].SYNTAX) continue;
-      const syn = def['OBJECT-TYPE'].SYNTAX;
-      const sname = Array.isArray(syn) ? syn[0] : syn;
-      // Exact SYNTAX matches win over SEQUENCE OF table wrappers: a table's
-      // OID must not claim its row type. ifTable (SEQUENCE OF IfEntry) only
-      // fills gaps left by the ifEntry row object itself.
-      const exact = sname !== 'SEQUENCE OF';
-      entries.push({ oid, typeName: exact ? sname : syn[1], exact });
+      if (!def) continue;
+      if (def['OBJECT-TYPE'] && def['OBJECT-TYPE'].SYNTAX) {
+        const syn = def['OBJECT-TYPE'].SYNTAX;
+        const sname = Array.isArray(syn) ? syn[0] : syn;
+        // Exact SYNTAX matches win over SEQUENCE OF table wrappers: a table's
+        // OID must not claim its row type. ifTable (SEQUENCE OF IfEntry) only
+        // fills gaps left by the ifEntry row object itself.
+        const exact = sname !== 'SEQUENCE OF';
+        entries.push({ oid, typeName: exact ? sname : syn[1], exact });
+      } else {
+        // Plain ASN.1 type with an OID (SMI '::=' node or assigned via
+        // setTypeOid/autoAssignOids): the type name is its own message type.
+        entries.push({ oid, typeName: name, exact: true });
+      }
     }
     for (const pass of [true, false]) {
       for (const { oid, typeName, exact } of entries) {
